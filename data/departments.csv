@@ -1,0 +1,5 @@
+department_id,department_name,floor,capacity
+1,"Cardiology Unit",2,40
+2,"Internal Medicine",2,32
+3,Neurosurgery,3,32
+4,Emergency,1,59

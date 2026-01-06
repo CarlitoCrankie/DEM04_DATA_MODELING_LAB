@@ -1,0 +1,5 @@
+specialty_id,specialty_name,specialty_code
+1,Cardiology,CARD
+2,Neurology,NEURO
+3,"Internal Medicine",IM
+4,Emergency,EM
