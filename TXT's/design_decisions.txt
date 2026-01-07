@@ -1,0 +1,149 @@
+DECISION 1: FACT TABLE GAIN
+CHOICE: One Row Per Encounter
+
+REASON: 
+The encounter is the fundamental business procees in the healthcare analytics.
+All four queries required are optimized with encounter-level grain: 
+
+1. Query 1 (Monthly Encounters by Specialty): Simple COUNT(*) aggregation
+2. Query 3 (Readmissions): Clean comparison of patient encounter
+3. QUery 4 (Revenue by specialty): Directp SUM(allowed_amount) per encounter
+
+For Query 2 (diagnosis-procedure pairs), we'll use bridge table to handle many-to-many relations 
+without comprimising the fact table grain. 
+
+The grain ensures that that the encounters financial metrica appear exactly once, the counts are accurate
+without DISTINCT clause and the fact table stays lean and performant.
+
+
+DECISION 2: DIMENSION TABLES
+We will create the following dimension tables:
+
+1. dim_date
+   - Purpose: Pre-compute all date/time attributes
+   - Key attributes: date_key (PK), calendar_date, year, quarter, month, 
+     day_name, is_weekend, fiscal_year
+   - Rationale: Eliminates date functions in queries; enables fast time-based 
+     filtering and grouping
+
+2. dim_patient
+   - Purpose: Describe patient demographics
+   - Key attributes: patient_key (PK), patient_id, mrn, first_name, last_name,
+     date_of_birth, gender, age_group
+   - Rationale: Denormalized patient attributes for easy cohort analysis
+
+3. dim_provider
+   - Purpose: Describe healthcare providers
+   - Key attributes: provider_key (PK), provider_id, full_name, credential,
+     specialty_id, specialty_name, specialty_code
+   - Rationale: Denormalize specialty information to reduce joins; most 
+     provider queries need specialty context
+
+4. dim_specialty
+   - Purpose: Describe medical specialties independently
+   - Key attributes: specialty_key (PK), specialty_id, specialty_name, 
+     specialty_code
+   - Rationale: Keep separate despite denormalization into dim_provider for
+     specialty-level analysis flexibility
+
+5. dim_department
+   - Purpose: Describe hospital departments
+   - Key attributes: department_key (PK), department_id, department_name,
+     floor, capacity
+   - Rationale: Enables location-based analysis and capacity planning
+
+6. dim_encounter_type
+   - Purpose: Describe types of patient encounters
+   - Key attributes: encounter_type_key (PK), encounter_type_name, 
+     encounter_type_code
+   - Rationale: Standardize encounter categorization; allows future attribute
+     additions
+
+7. dim_diagnosis
+   - Purpose: Describe ICD-10 diagnoses (for bridge table)
+   - Key attributes: diagnosis_key (PK), diagnosis_id, icd10_code, 
+     icd10_description
+   - Rationale: Referenced by bridge table for many-to-many relationship
+
+8. dim_procedure
+   - Purpose: Describe CPT procedures (for bridge table)
+   - Key attributes: procedure_key (PK), procedure_id, cpt_code, 
+     cpt_description
+   - Rationale: Referenced by bridge table for many-to-many relationship
+
+DENORMALIZATION DECISIONS:
+- Specialty denormalized into dim_provider (common access pattern)
+- Specialty kept as separate dimension (independent analysis)
+- Date attributes pre-computed in dim_date (performance)
+- Patient age_group pre-computed (cohort analysis)
+
+
+DECISION 3: PRE-AGGREGATED METRICS
+We will store the following pre-aggregated metrics in fact_encounters:
+
+1. diagnosis_count (INT)
+   - Definition: Number of diagnoses associated with this encounter
+   - Source: COUNT(*) from encounter_diagnoses
+   - Why: Avoids bridge table join for simple diagnosis counts; enables 
+     fast filtering on diagnostic complexity
+
+2. procedure_count (INT)
+   - Definition: Number of procedures associated with this encounter
+   - Source: COUNT(*) from encounter_procedures
+   - Why: Enables procedure volume analysis without bridge table join
+
+3. total_claim_amount (DECIMAL(12,2))
+   - Definition: Sum of all claim amounts for this encounter
+   - Source: SUM(claim_amount) from billing where encounter_id matches
+   - Why: Handles multiple billing records per encounter; provides 
+     gross revenue metric
+
+4. total_allowed_amount (DECIMAL(12,2))
+   - Definition: Sum of all allowed amounts (actual revenue)
+   - Source: SUM(allowed_amount) from billing
+   - Why: Critical financial metric; Query 4 needs this frequently; 
+     eliminates billing table join
+
+5. length_of_stay_days (INT, nullable for outpatient)
+   - Definition: Days between admission and discharge for inpatient encounters
+   - Source: DATEDIFF(discharge_date, encounter_date)
+   - Why: Key efficiency metric; avoids date calculations in every query
+
+PERFORMANCE BENEFIT:
+Pre-aggregating these metrics during ETL (once) eliminates:
+- Expensive COUNT() operations over bridge tables in queries
+- Multiple joins to billing table for revenue calculations
+- Repeated date calculations
+- Subqueries for derived metrics
+
+This trades ETL complexity for query simplicity and speed.
+
+METRICS WE WILL NOT PRE-AGGREGATE:
+- Readmission rates (non-additive, contextual)
+- Average values (calculate as SUM/COUNT in queries)
+- Rankings (contextual, query-specific)
+
+
+DECISION 4: BRIDGE TABLES
+CHOICE: Use bridge tables for many-to-many relationships
+
+DESIGN:
+
+1. bridge_encounter_diagnoses
+   - Links fact_encounters to dim_diagnosis
+   - Preserves diagnosis_sequence (primary vs. secondary)
+   - Compound PK: (encounter_key, diagnosis_key)
+
+2. bridge_encounter_procedures  
+   - Links fact_encounters to dim_procedure
+   - Stores procedure_date for temporal analysis
+   - Includes procedure_sequence
+   - Compound PK: (encounter_key, procedure_key)
+
+RATIONALE:
+
+Why bridge tables instead of exploding the fact table?
+1. Maintains clean encounter grain (one row per encounter in fact table)
+2. Accurate metric calculations (counts and sums not inflated)
+3. Selective joining (only join bridge when analyzing specific diagnoses/procedures)
+4. Standard dimensional modeling pattern
