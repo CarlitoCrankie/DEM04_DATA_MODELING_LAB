@@ -1,0 +1,517 @@
+# ETL DESIGN DOCUMENT
+=====================
+
+## Overview
+This document describes the Extract-Transform-Load (ETL) process for populating the healthcare analytics star schema from the normalized OLTP database.
+
+**ETL Philosophy**: The ETL does the heavy lifting ONCE so queries can be fast ALWAYS.
+
+---
+
+## ETL ARCHITECTURE
+
+### High-Level Flow
+```
+OLTP Database (Normalized)
+         ↓
+    [EXTRACT] - Pull source data
+         ↓
+   [TRANSFORM] - Clean, enrich, aggregate
+         ↓
+      [LOAD] - Insert into star schema
+         ↓
+Star Schema (Denormalized)
+```
+
+### Execution Schedule
+- **Frequency**: Daily batch load (runs overnight)
+- **Start Time**: 2:00 AM (low system usage)
+- **Duration**: ~2-4 hours for full refresh
+- **Incremental**: Load only yesterday's encounters (after initial load)
+
+---
+
+## DIMENSION LOAD LOGIC
+
+### Principle: Dimensions First, Facts Second
+Always load dimensions before facts because facts reference dimension keys.
+
+---
+
+### DIM_DATE (One-Time Load)
+
+**Purpose**: Pre-compute all date attributes for a date range
+
+**Load Type**: One-time full load (e.g., 2020-2030)
+
+**Pseudocode**:
+```
+FUNCTION load_dim_date(start_date, end_date):
+    current_date = start_date
+    
+    WHILE current_date <= end_date:
+        date_key = FORMAT(current_date, 'YYYYMMDD')  // e.g., 20240510
+        
+        // Calendar attributes
+        year = EXTRACT(YEAR FROM current_date)
+        quarter = CEILING(EXTRACT(MONTH FROM current_date) / 3)
+        month = EXTRACT(MONTH FROM current_date)
+        day_of_week = DAYOFWEEK(current_date)
+        
+        // Derived attributes
+        quarter_name = 'Q' + quarter + ' ' + year
+        month_name = FORMAT(current_date, 'MMMM')
+        month_year = month_name + ' ' + year
+        day_name = FORMAT(current_date, 'dddd')
+        is_weekend = (day_of_week IN (1, 7))
+        
+        // Fiscal calendar (example: fiscal year starts July 1)
+        IF month >= 7:
+            fiscal_year = year
+            fiscal_quarter = CEILING((month - 6) / 3)
+        ELSE:
+            fiscal_year = year - 1
+            fiscal_quarter = CEILING((month + 6) / 3)
+        
+        INSERT INTO dim_date VALUES (
+            date_key, current_date, year, quarter, quarter_name,
+            month, month_name, month_year, day_of_month, day_of_week,
+            day_name, week_of_year, is_weekend, FALSE as is_holiday,
+            fiscal_year, fiscal_quarter, fiscal_period
+        )
+        
+        current_date = current_date + 1 DAY
+    END WHILE
+END FUNCTION
+
+// Execute once
+load_dim_date('2020-01-01', '2030-12-31')
+```
+
+---
+
+### DIM_PATIENT (Incremental SCD Type 1)
+
+**Purpose**: Load patient demographics with age grouping
+
+**Load Type**: Incremental daily (new + changed patients)
+
+**Pseudocode**:
+```
+FUNCTION load_dim_patient():
+    // Extract new or changed patients from OLTP
+    source_patients = QUERY:
+        SELECT patient_id, first_name, last_name, date_of_birth, 
+               gender, mrn
+        FROM patients
+        WHERE modified_date >= YESTERDAY 
+           OR patient_id NOT IN (SELECT patient_id FROM dim_patient)
+    
+    FOR EACH patient IN source_patients:
+        // Calculate derived attributes
+        full_name = patient.first_name + ' ' + patient.last_name
+        current_age = YEAR(CURRENT_DATE) - YEAR(patient.date_of_birth)
+        
+        // Age grouping for cohort analysis
+        IF current_age < 18:
+            age_group = '0-17'
+        ELSE IF current_age < 35:
+            age_group = '18-34'
+        ELSE IF current_age < 50:
+            age_group = '35-49'
+        ELSE IF current_age < 65:
+            age_group = '50-64'
+        ELSE:
+            age_group = '65+'
+        
+        // Upsert
+        MERGE INTO dim_patient
+        USING source_patient
+        ON dim_patient.patient_id = source_patient.patient_id
+        WHEN MATCHED THEN UPDATE SET
+            first_name = source_patient.first_name,
+            last_name = source_patient.last_name,
+            full_name = calculated_full_name,
+            age_group = calculated_age_group,
+            effective_date = CURRENT_DATE
+        WHEN NOT MATCHED THEN INSERT (
+            patient_id, mrn, first_name, last_name, full_name,
+            date_of_birth, gender, age_group, source_system,
+            effective_date, is_current
+        )
+    END FOR
+END FUNCTION
+```
+
+---
+
+### DIM_SPECIALTY (Full Refresh)
+
+**Purpose**: Load specialty reference data
+
+**Load Type**: Full refresh (small table)
+
+**Pseudocode**:
+```
+FUNCTION load_dim_specialty():
+    TRUNCATE dim_specialty
+    
+    INSERT INTO dim_specialty (specialty_id, specialty_name, specialty_code)
+    SELECT specialty_id, specialty_name, specialty_code
+    FROM specialties
+END FUNCTION
+```
+
+---
+
+### DIM_PROVIDER (Incremental with Denormalization)
+
+**Purpose**: Load provider data WITH denormalized specialty information
+
+**Key Challenge**: Must denormalize specialty data
+
+**Pseudocode**:
+```
+FUNCTION load_dim_provider():
+    source_providers = QUERY:
+        SELECT 
+            p.provider_id,
+            p.first_name,
+            p.last_name,
+            p.credential,
+            p.specialty_id,
+            s.specialty_name,      -- DENORMALIZED
+            s.specialty_code       -- DENORMALIZED
+        FROM providers p
+        JOIN specialties s ON p.specialty_id = s.specialty_id
+        WHERE p.modified_date >= YESTERDAY 
+           OR p.provider_id NOT IN (SELECT provider_id FROM dim_provider)
+    
+    FOR EACH provider IN source_providers:
+        full_name = 'Dr. ' + provider.first_name + ' ' + provider.last_name
+        
+        MERGE INTO dim_provider
+        USING source_provider
+        ON dim_provider.provider_id = source_provider.provider_id
+        WHEN MATCHED THEN UPDATE SET
+            first_name = source_provider.first_name,
+            last_name = source_provider.last_name,
+            full_name = calculated_full_name,
+            credential = source_provider.credential,
+            specialty_id = source_provider.specialty_id,
+            specialty_name = source_provider.specialty_name,  -- DENORMALIZED
+            specialty_code = source_provider.specialty_code   -- DENORMALIZED
+        WHEN NOT MATCHED THEN INSERT (...)
+    END FOR
+END FUNCTION
+```
+
+---
+
+### DIM_DEPARTMENT, DIM_ENCOUNTER_TYPE (Full Refresh)
+
+**Pseudocode**:
+```
+FUNCTION load_dim_department():
+    TRUNCATE dim_department
+    
+    INSERT INTO dim_department (department_id, department_name, floor, capacity)
+    SELECT department_id, department_name, floor, capacity
+    FROM departments
+END FUNCTION
+
+FUNCTION load_dim_encounter_type():
+    TRUNCATE dim_encounter_type
+    
+    INSERT INTO dim_encounter_type 
+    (encounter_type_name, encounter_type_code, requires_admission, average_duration_hours)
+    VALUES
+        ('Outpatient', 'OP', FALSE, 1.5),
+        ('Inpatient', 'IP', TRUE, 96.0),
+        ('Emergency', 'ER', FALSE, 6.5)
+END FUNCTION
+```
+
+---
+
+### DIM_DIAGNOSIS & DIM_PROCEDURE (Full Refresh)
+
+**Pseudocode**:
+```
+FUNCTION load_dim_diagnosis():
+    TRUNCATE dim_diagnosis
+    
+    INSERT INTO dim_diagnosis (diagnosis_id, icd10_code, icd10_description)
+    SELECT diagnosis_id, icd10_code, icd10_description
+    FROM diagnoses
+END FUNCTION
+
+FUNCTION load_dim_procedure():
+    TRUNCATE dim_procedure
+    
+    INSERT INTO dim_procedure (procedure_id, cpt_code, cpt_description)
+    SELECT procedure_id, cpt_code, cpt_description
+    FROM procedures
+END FUNCTION
+```
+
+---
+
+## FACT TABLE LOAD LOGIC
+
+### FACT_ENCOUNTERS (Incremental Daily Load)
+
+**Purpose**: Load encounter facts with all dimension keys and pre-aggregated metrics
+
+**Pseudocode**:
+```
+FUNCTION load_fact_encounters(load_date):
+    // Extract encounters for load date
+    source_encounters = QUERY:
+        SELECT 
+            e.encounter_id,
+            e.encounter_date,
+            e.discharge_date,
+            e.patient_id,
+            e.provider_id,
+            e.encounter_type,
+            e.department_id
+        FROM encounters e
+        WHERE DATE(e.encounter_date) = load_date
+    
+    FOR EACH encounter IN source_encounters:
+        
+        // --- DIMENSION KEY LOOKUPS ---
+        
+        date_key = FORMAT(encounter.encounter_date, 'YYYYMMDD')
+        
+        patient_key = QUERY:
+            SELECT patient_key FROM dim_patient WHERE patient_id = encounter.patient_id
+        
+        IF patient_key IS NULL:
+            LOG_ERROR("Patient not found: " + encounter.patient_id)
+            SKIP THIS ENCOUNTER
+        
+        provider_key = QUERY:
+            SELECT provider_key FROM dim_provider WHERE provider_id = encounter.provider_id
+        
+        specialty_key = QUERY:
+            SELECT specialty_key FROM dim_specialty 
+            WHERE specialty_id = (
+                SELECT specialty_id FROM providers WHERE provider_id = encounter.provider_id
+            )
+        
+        department_key = QUERY:
+            SELECT department_key FROM dim_department WHERE department_id = encounter.department_id
+        
+        encounter_type_key = QUERY:
+            SELECT encounter_type_key FROM dim_encounter_type 
+            WHERE encounter_type_name = encounter.encounter_type
+        
+        // --- PRE-AGGREGATE METRICS ---
+        
+        diagnosis_count = QUERY:
+            SELECT COUNT(*) FROM encounter_diagnoses WHERE encounter_id = encounter.encounter_id
+        
+        procedure_count = QUERY:
+            SELECT COUNT(*) FROM encounter_procedures WHERE encounter_id = encounter.encounter_id
+        
+        billing_metrics = QUERY:
+            SELECT 
+                SUM(claim_amount) AS total_claim_amount,
+                SUM(allowed_amount) AS total_allowed_amount
+            FROM billing
+            WHERE encounter_id = encounter.encounter_id
+              AND claim_status = 'Paid'
+        
+        IF encounter.encounter_type = 'Inpatient' AND encounter.discharge_date IS NOT NULL:
+            length_of_stay_days = DATEDIFF(encounter.discharge_date, encounter.encounter_date)
+        ELSE:
+            length_of_stay_days = NULL
+        
+        // --- INSERT INTO FACT TABLE ---
+        
+        INSERT INTO fact_encounters (
+            encounter_id,
+            date_key,
+            patient_key,
+            provider_key,
+            specialty_key,
+            department_key,
+            encounter_type_key,
+            encounter_date,
+            discharge_date,
+            diagnosis_count,
+            procedure_count,
+            total_claim_amount,
+            total_allowed_amount,
+            length_of_stay_days,
+            etl_loaded_date
+        ) VALUES (...)
+    END FOR
+    
+    COMMIT
+END FUNCTION
+```
+
+---
+
+## BRIDGE TABLE LOAD LOGIC
+
+### BRIDGE_ENCOUNTER_DIAGNOSES
+
+**Pseudocode**:
+```
+FUNCTION load_bridge_encounter_diagnoses(load_date):
+    source_data = QUERY:
+        SELECT 
+            ed.encounter_id,
+            ed.diagnosis_id,
+            ed.diagnosis_sequence
+        FROM encounter_diagnoses ed
+        JOIN encounters e ON ed.encounter_id = e.encounter_id
+        WHERE DATE(e.encounter_date) = load_date
+    
+    FOR EACH record IN source_data:
+        encounter_key = QUERY:
+            SELECT encounter_key FROM fact_encounters WHERE encounter_id = record.encounter_id
+        
+        diagnosis_key = QUERY:
+            SELECT diagnosis_key FROM dim_diagnosis WHERE diagnosis_id = record.diagnosis_id
+        
+        INSERT INTO bridge_encounter_diagnoses (
+            encounter_key,
+            diagnosis_key,
+            diagnosis_sequence
+        ) VALUES (
+            encounter_key,
+            diagnosis_key,
+            record.diagnosis_sequence
+        )
+    END FOR
+    
+    COMMIT
+END FUNCTION
+```
+
+### BRIDGE_ENCOUNTER_PROCEDURES
+
+**Pseudocode**:
+```
+FUNCTION load_bridge_encounter_procedures(load_date):
+    source_data = QUERY:
+        SELECT 
+            ep.encounter_id,
+            ep.procedure_id,
+            ep.procedure_date,
+            ROW_NUMBER() OVER (PARTITION BY ep.encounter_id 
+                               ORDER BY ep.procedure_date) AS procedure_sequence
+        FROM encounter_procedures ep
+        JOIN encounters e ON ep.encounter_id = e.encounter_id
+        WHERE DATE(e.encounter_date) = load_date
+    
+    FOR EACH record IN source_data:
+        encounter_key = LOOKUP(fact_encounters, encounter_id = record.encounter_id)
+        procedure_key = LOOKUP(dim_procedure, procedure_id = record.procedure_id)
+        
+        INSERT INTO bridge_encounter_procedures (
+            encounter_key,
+            procedure_key,
+            procedure_date,
+            procedure_sequence
+        ) VALUES (...)
+    END FOR
+    
+    COMMIT
+END FUNCTION
+```
+
+---
+
+## REFRESH STRATEGY
+
+### Daily Incremental Load
+
+**Schedule**:
+```
+2:00 AM - Start ETL
+2:00-2:15 AM - Load dimensions
+2:15-3:30 AM - Load fact_encounters
+3:30-4:00 AM - Load bridge tables
+4:00 AM - Data quality checks
+```
+
+**Pseudocode**:
+```
+FUNCTION run_daily_etl():
+    load_date = YESTERDAY
+    
+    TRY:
+        BEGIN TRANSACTION
+        
+        // Dimensions first
+        load_dim_patient()
+        load_dim_provider()
+        load_dim_specialty()
+        load_dim_department()
+        load_dim_encounter_type()
+        load_dim_diagnosis()
+        load_dim_procedure()
+        
+        // Facts second
+        load_fact_encounters(load_date)
+        
+        // Bridges third
+        load_bridge_encounter_diagnoses(load_date)
+        load_bridge_encounter_procedures(load_date)
+        
+        COMMIT
+        
+        run_data_quality_checks(load_date)
+        SEND_SUCCESS_EMAIL("ETL completed")
+        
+    CATCH error:
+        ROLLBACK
+        LOG_ERROR(error)
+        SEND_ALERT_EMAIL("ETL failed: " + error)
+    END TRY
+END FUNCTION
+```
+
+---
+
+## DATA QUALITY CHECKS
+
+**Critical checks**:
+
+```
+FUNCTION run_data_quality_checks(load_date):
+    // Check 1: Row counts match
+    oltp_count = COUNT(*) FROM encounters WHERE DATE(encounter_date) = load_date
+    dw_count = COUNT(*) FROM fact_encounters WHERE date_key = FORMAT(load_date, 'YYYYMMDD')
+    
+    ASSERT oltp_count = dw_count
+    
+    // Check 2: No orphaned foreign keys
+    orphans = COUNT(*) FROM fact_encounters f
+              LEFT JOIN dim_patient p ON f.patient_key = p.patient_key
+              WHERE p.patient_key IS NULL
+    
+    ASSERT orphans = 0
+    
+    // Check 3: Pre-aggregated metrics are correct
+    sample = SELECT RANDOM encounter_id FROM fact_encounters
+    
+    expected_diag = COUNT(*) FROM encounter_diagnoses WHERE encounter_id = sample
+    actual_diag = SELECT diagnosis_count FROM fact_encounters WHERE encounter_id = sample
+    
+    ASSERT expected_diag = actual_diag
+    
+    // Check 4: Revenue totals match
+    oltp_revenue = SUM(allowed_amount) FROM billing 
+                   WHERE encounter_id IN (today's encounters)
+    dw_revenue = SUM(total_allowed_amount) FROM fact_encounters WHERE date_key = today
+    
+    ASSERT oltp_revenue = dw_revenue
+END FUNCTION
+```

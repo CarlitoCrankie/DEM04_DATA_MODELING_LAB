@@ -1,0 +1,143 @@
+-- Question 1: [Monthly encounters by specialty]
+SQL Query:
+SELECT
+    DATE_FORMAT(e.encounter_date, '%Y-%M') AS month,
+    s.specialty_name,
+    e.encounter_type,
+    COUNT(e.encounter_id) AS total_encounters,
+    COUNT(DISTINCT e.patient_id) AS unique_patients
+FROM encounters e
+JOIN providers p ON e.provider_id = p.provider_id
+JOIN specialties s ON p.specialty_id = s.specialty_id
+GROUp BY 
+    month,
+    s.specialty_name,
+    e.encounter_type
+ORDER BY month, s.specialty_name, e.encounter_type;
+
+Schema Analysis:
+Tables Joined: 3 Tables ( encounters -> providers -> specialties)
+Number of Joins: 2 Join operations 
+Performance:
+Execution Time: 47ms
+Estimated rows scanned: 10000; 444 rows returned
+
+Bottleneck:
+Why this is slow ? 
+1. JOIN Chain: Every encounter must look up its provider, then that provider's specialty.
+2. No Direct Path: There's no direct link from encounters to specialties - we're forced through providers.
+3. GROUP BY After Joins: We join ALL the data first, THEN aggregate.
+4. Date Function in GROUP BY: `DATE_FORMAT()` runs on every row.
+
+ In a real system with millions of encounters this query would run the entire encounters table
+ lookup each provider and specialty (millions of records) then it finally groups and counts.
+
+
+
+ -- Question 2: [Top Diagnosis-Procedure Pairs]
+SQL Query:
+SELECT 
+    d.icd10_code,
+    d.icd10_description,
+    pr.cpt_code,
+    pr.cpt_description,
+    COUNT(*) AS combination_count
+FROM encounter_diagnoses ed
+JOIN diagnoses d ON ed.diagnosis_id = d.diagnosis_id
+JOIN encounter_procedures ep ON ed.encounter_id = ep.encounter_id
+JOIN procedures pr ON ep.procedure_id = pr.procedure_id
+GROUP BY
+    d.icd10_code,
+    d.icd10_description,
+    pr.cpt_code,
+    pr.cpt_description
+ORDER BY combination_count DESC
+LIMIT 20;
+
+Schema Analysis:
+Tables Joined: 4 Tables (encounter_diagnoses, encounter_procedures, procedures, diagnoses)
+Number of Joins: 3 Join operations 
+Performance:
+Execution Time: 31ms
+Estimated rows scanned: 400; 20 rows returned
+
+Bottleneck:
+1. The Cartesian explosion(Row explosion): Two junction tables create a multiplicative effect.
+   E.g. An Encounter with : 10 diagnosis, 8 procedures will equals 80 rows from one encounter.
+2. each diagnoses pairs with every procedure in the same encounter.
+3. The database must process all the intermediate rows before GROUP BY collapses them back down.
+ The query above would explode millions of encounter records into tens of millions of intermediate rows.
+
+
+
+-- Question 3: [30-Day Readmission Rate]
+SQL Query:
+SELECT
+    s.specialty_name,
+    COUNT(DISTINCT e1.encounter_id) AS total_inpatient_discharges,
+    COUNT(DISTINCT e2.encounter_id) AS readmissions_within_30_days,
+    ROUND(100.0 * COUNT(DISTINCT e2.encounter_id) / COUNT(DISTINCT e1.encounter_id), 2) AS readmission_rate_percentage
+FROM encounters e1
+JOIN providers p1 on e1.provider_id = p1.provider_id
+JOIN specialties s on p1.specialty_id = s.specialty_id
+LEFT JOIN encounters e2 ON e1.patient_id = e2.patient_id
+    AND e2.encounter_type = 'Inpatient'
+    AND e2.encounter_date > e1.discharge_date
+    AND e2.encounter_date <= DATE_ADD(e1.discharge_date, INTERVAL 30 DAY)
+    AND e2.encounter_id != e1.encounter_id
+WHERE e1.encounter_type = 'Inpatient'
+    AND e1.discharge_date IS NOT NULL
+GROUP BY s.specialty_name
+ORDER BY readmission_rate_percentage DESC;
+
+Schema Analysis:
+Tables Joined: 3 unique Tables , but encounters is used TWICE (SELF JOIN)
+Number of Joins: 3 Join operations (Including the Self Join)
+Performance:
+Execution Time: 31ms
+Estimated rows scanned: 400; 20 rows returned
+
+Bottleneck:
+1. The Self-join on large tables: every encounter compares to every other encounter for the same patient
+2. Million of comparisons for million encounters
+3. Data range calculation happens for evry comparison.
+4. The database must check 5 conditions for every comparison.
+
+
+-- Question 4: [Revenue By Specialty & Month]
+SQL Query:
+SELECT 
+    DATE_FORMAT(b.claim_date, '%Y-%m') AS month,
+    s.specialty_name,
+    COUNT(DISTINCT b.billing_id) AS total_claims,
+    SUM(b.claim_amount) AS total_billed,
+    SUM(b.allowed_amount) AS total_revenue,
+    ROUND(AVG(b.allowed_amount), 2) AS avg_claim_value
+FROM billing b
+JOIN encounters e ON b.encounter_id = e.encounter_id
+JOIN providers p ON e.provider_id = p.provider_id
+JOIN specialties s ON p.specialty_id = s.specialty_id
+WHERE b.claim_status = 'Paid'
+GROUP BY 
+    DATE_FORMAT(b.claim_date, '%Y-%m'),
+    s.specialty_name
+ORDER BY month, total_revenue DESC;
+
+Schema Analysis:
+Tables Joined: 4 (billing, encounters, providers, specialties)
+Number of Joins: 3 Join operations 
+Performance:
+Execution Time: 31ms
+Estimated rows scanned: 400; 20 rows returned
+
+Bottleneck:
+1. Sequential dependency: Can't get to specialties without going through encounters AND providers
+2. Each join filters and reshapes data:
+
+    + Start with billing records
+    + Join to encounters (lookup)
+    + Join to providers (another lookup)
+    + Join to specialties (third lookup)
+
+Aggregation happens last: SUM() and AVG() only execute after all joins complete
+Date formatting: DATE_FORMAT() runs on every row before grouping
