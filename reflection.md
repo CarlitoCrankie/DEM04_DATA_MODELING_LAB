@@ -10,7 +10,7 @@ This reflection analyzes the performance improvements, design trade-offs, and le
 
 ## Part 1: Why Is the Star Schema Faster?
 
-The star schema delivers 10-25x performance improvements over the normalized OLTP schema. This isn't magic—it's the result of deliberate design choices that optimize for analytical query patterns.
+The star schema delivers 10-25x performance improvements over the normalized OLTP schema.
 
 ### 1.1 Reduced Join Depth
 
