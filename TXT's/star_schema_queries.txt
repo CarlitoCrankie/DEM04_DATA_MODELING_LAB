@@ -1,3 +1,4 @@
+```
 # STAR SCHEMA OPTIMIZED QUERIES
 
 ========================================
@@ -26,17 +27,17 @@ LIMIT 10;
 
 ### Execution Time
 
-* ~5,334 ms vs. ~2,551 ms (OLTP)
+* ~5,472 ms vs. ~3,910 ms (OLTP)
 
 ### Improvement Factor
 
-* 0.48× (Star slower at this scale)
+* 0.71× (Star slower at this scale)
 
 ### Explanation
 
 * Three dimension joins introduce additional overhead
 * Fact table rows are wider, increasing scan cost
-* OLTP’s simpler join path is highly optimized at this volume
+* OLTP's simpler join path is highly optimized at this volume
 * Small result set (10 rows) does not benefit from star schema structure
 
 ---
@@ -66,11 +67,11 @@ LIMIT 20;
 
 ### Execution Time
 
-* ~24,470 ms vs. ~32,677 ms (OLTP)
+* ~27,898 ms vs. ~42,002 ms (OLTP)
 
 ### Improvement Factor
 
-* 1.34× faster
+* 1.51× faster
 
 ### Explanation
 
@@ -115,11 +116,11 @@ GROUP BY s.specialty_name;
 
 ### Execution Time
 
-* ~5,410 ms vs. ~5,289 ms (OLTP)
+* ~6,024 ms vs. ~6,110 ms (OLTP)
 
 ### Improvement Factor
 
-*  0.98× (essentially equal)
+*  1.01× (essentially equal)
 
 ### Explanation
 
@@ -154,11 +155,11 @@ LIMIT 20;
 
 ### Execution Time
 
-* ~3,083 ms vs. ~7,501 ms (OLTP)
+* ~4,285 ms vs. ~9,095 ms (OLTP)
 
 ### Improvement Factor
 
-* 2.43× faster
+* 2.12× faster
 
 ### Explanation
 
@@ -166,4 +167,4 @@ LIMIT 20;
 * Revenue values pre-aggregated during ETL
 * No DATE_FORMAT() calls at query time
 * Fewer joins and simpler aggregation logic
-
+```

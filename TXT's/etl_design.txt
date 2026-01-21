@@ -1,517 +1,479 @@
 # ETL DESIGN DOCUMENT
-=====================
-
-## Overview
-This document describes the Extract-Transform-Load (ETL) process for populating the healthcare analytics star schema from the normalized OLTP database.
-
-**ETL Philosophy**: The ETL does the heavy lifting ONCE so queries can be fast ALWAYS.
+## Healthcare Analytics: OLTP to Star Schema
 
 ---
 
-## ETL ARCHITECTURE
+## 1. ARCHITECTURE
 
-### High-Level Flow
+### 1.1 Pipeline Flow
 ```
-OLTP Database (Normalized)
-         ↓
-    [EXTRACT] - Pull source data
-         ↓
-   [TRANSFORM] - Clean, enrich, aggregate
-         ↓
-      [LOAD] - Insert into star schema
-         ↓
-Star Schema (Denormalized)
+OLTP (Normalized) 
+  → EXTRACT: Pull source data
+  → TRANSFORM: Clean, enrich, aggregate  
+  → LOAD: Insert into star schema
+  → VALIDATE: Data quality checks
+  → LOG: Record execution
 ```
 
-### Execution Schedule
-- **Frequency**: Daily batch load (runs overnight)
-- **Start Time**: 2:00 AM (low system usage)
-- **Duration**: ~2-4 hours for full refresh
-- **Incremental**: Load only yesterday's encounters (after initial load)
+### 1.2 Execution
+- **Schedule:** Daily at 2:00 AM
+- **Mode:** Full refresh (truncate & reload)
+- **Duration:** ~3 minutes for 500K encounters
+- **Throughput:** 174K encounters/min
 
----
-
-## DIMENSION LOAD LOGIC
-
-### Principle: Dimensions First, Facts Second
-Always load dimensions before facts because facts reference dimension keys.
-
----
-
-### DIM_DATE (One-Time Load)
-
-**Purpose**: Pre-compute all date attributes for a date range
-
-**Load Type**: One-time full load (e.g., 2020-2030)
-
-**Pseudocode**:
+### 1.3 File Structure
 ```
-FUNCTION load_dim_date(start_date, end_date):
-    current_date = start_date
-    
-    WHILE current_date <= end_date:
-        date_key = FORMAT(current_date, 'YYYYMMDD')  // e.g., 20240510
-        
-        // Calendar attributes
-        year = EXTRACT(YEAR FROM current_date)
-        quarter = CEILING(EXTRACT(MONTH FROM current_date) / 3)
-        month = EXTRACT(MONTH FROM current_date)
-        day_of_week = DAYOFWEEK(current_date)
-        
-        // Derived attributes
-        quarter_name = 'Q' + quarter + ' ' + year
-        month_name = FORMAT(current_date, 'MMMM')
-        month_year = month_name + ' ' + year
-        day_name = FORMAT(current_date, 'dddd')
-        is_weekend = (day_of_week IN (1, 7))
-        
-        // Fiscal calendar (example: fiscal year starts July 1)
-        IF month >= 7:
-            fiscal_year = year
-            fiscal_quarter = CEILING((month - 6) / 3)
-        ELSE:
-            fiscal_year = year - 1
-            fiscal_quarter = CEILING((month + 6) / 3)
-        
-        INSERT INTO dim_date VALUES (
-            date_key, current_date, year, quarter, quarter_name,
-            month, month_name, month_year, day_of_month, day_of_week,
-            day_name, week_of_year, is_weekend, FALSE as is_holiday,
-            fiscal_year, fiscal_quarter, fiscal_period
-        )
-        
-        current_date = current_date + 1 DAY
-    END WHILE
-END FUNCTION
-
-// Execute once
-load_dim_date('2020-01-01', '2030-12-31')
+SQL_scripts/
+├── star_schema.sql          # DDL
+├── etl_logging_setup.sql    # Logging infrastructure
+├── etl_pipeline.sql         # Main ETL logic
+├── clean_star_schema.sql    # Truncate tables
 ```
 
 ---
 
-### DIM_PATIENT (Incremental SCD Type 1)
+## 2. LOGGING INFRASTRUCTURE
 
-**Purpose**: Load patient demographics with age grouping
+### 2.1 Tables
 
-**Load Type**: Incremental daily (new + changed patients)
+**etl_batch_control** - Batch execution tracking
+- `batch_id`: YYYYMMDD_HHMMSS_XXX
+- `status`: RUNNING | COMPLETED | COMPLETED_WITH_WARNINGS | FAILED
+- `total_rows_processed`, `total_errors`
+- `last_successful_encounter_id`: For restart capability
 
-**Pseudocode**:
-```
-FUNCTION load_dim_patient():
-    // Extract new or changed patients from OLTP
-    source_patients = QUERY:
-        SELECT patient_id, first_name, last_name, date_of_birth, 
-               gender, mrn
-        FROM patients
-        WHERE modified_date >= YESTERDAY 
-           OR patient_id NOT IN (SELECT patient_id FROM dim_patient)
-    
-    FOR EACH patient IN source_patients:
-        // Calculate derived attributes
-        full_name = patient.first_name + ' ' + patient.last_name
-        current_age = YEAR(CURRENT_DATE) - YEAR(patient.date_of_birth)
-        
-        // Age grouping for cohort analysis
-        IF current_age < 18:
-            age_group = '0-17'
-        ELSE IF current_age < 35:
-            age_group = '18-34'
-        ELSE IF current_age < 50:
-            age_group = '35-49'
-        ELSE IF current_age < 65:
-            age_group = '50-64'
-        ELSE:
-            age_group = '65+'
-        
-        // Upsert
-        MERGE INTO dim_patient
-        USING source_patient
-        ON dim_patient.patient_id = source_patient.patient_id
-        WHEN MATCHED THEN UPDATE SET
-            first_name = source_patient.first_name,
-            last_name = source_patient.last_name,
-            full_name = calculated_full_name,
-            age_group = calculated_age_group,
-            effective_date = CURRENT_DATE
-        WHEN NOT MATCHED THEN INSERT (
-            patient_id, mrn, first_name, last_name, full_name,
-            date_of_birth, gender, age_group, source_system,
-            effective_date, is_current
-        )
-    END FOR
-END FUNCTION
+**etl_log** - Step-by-step execution log
+- `log_level`: INFO | WARNING | ERROR
+- `step_name`, `message`, `rows_affected`, `execution_time_seconds`
+
+**etl_error_records** - Failed record details
+- `source_table`, `source_id`, `error_type`, `error_message`
+- `field_name`, `field_value`, `resolved`
+
+### 2.2 Procedures
+```sql
+CALL start_etl_batch(@batch_id, 'FULL_REFRESH');
+CALL log_etl_event(@batch_id, 'INFO', 'step', 'message', rows, seconds);
+CALL log_etl_error(@batch_id, 'table', id, 'type', 'message', 'field', 'value');
+CALL complete_etl_batch(@batch_id, 'COMPLETED', 'notes');
+CALL get_batch_summary(@batch_id);
 ```
 
 ---
 
-### DIM_SPECIALTY (Full Refresh)
+## 3. DIMENSION LOADS
 
-**Purpose**: Load specialty reference data
-
-**Load Type**: Full refresh (small table)
-
-**Pseudocode**:
+### 3.1 Load Order
 ```
-FUNCTION load_dim_specialty():
-    TRUNCATE dim_specialty
-    
-    INSERT INTO dim_specialty (specialty_id, specialty_name, specialty_code)
-    SELECT specialty_id, specialty_name, specialty_code
-    FROM specialties
-END FUNCTION
+1. dim_date (one-time)
+2. dim_specialty, dim_department, dim_encounter_type, dim_diagnosis, dim_procedure
+3. dim_patient (batched: 20K/batch)
+4. dim_provider (depends on dim_specialty)
+```
+
+### 3.2 dim_date (One-Time)
+```
+FOR each date FROM '2020-01-01' TO '2030-12-31':
+  date_key = YYYYMMDD integer
+  year, quarter, month, day_of_week
+  quarter_name = 'Q2 2024'
+  month_year = 'May 2024'
+  is_weekend = (day_of_week IN (1,7))
+  fiscal_year = IF month >= 7 THEN year ELSE year-1
+  fiscal_quarter = calculated based on fiscal_year
+  INSERT INTO dim_date
+```
+**Result:** 4,018 dates
+
+### 3.3 dim_patient (Batched)
+```
+FOR batch IN (1-20K, 20K-40K, 40K-60K, 60K-80K, 80K-100K):
+  
+  # Log invalid records
+  LOG patients WHERE date_of_birth IS NULL OR > CURDATE()
+  
+  # Load valid patients
+  INSERT INTO dim_patient
+    SELECT patient_id, mrn, first_name, last_name,
+           CONCAT(first_name, ' ', last_name) AS full_name,
+           date_of_birth, gender,
+           CASE WHEN age < 18 THEN '0-17'
+                WHEN age < 35 THEN '18-34'
+                WHEN age < 50 THEN '35-49'
+                WHEN age < 65 THEN '50-64'
+                ELSE '65+' END AS age_group
+    FROM patients
+    WHERE date_of_birth IS NOT NULL AND date_of_birth <= CURDATE()
+    AND patient_id BETWEEN batch_start AND batch_end
+```
+**Result:** 100K patients, 0 errors
+
+### 3.4 dim_provider (Denormalized)
+```
+# Log providers with missing specialty
+LOG providers WHERE specialty_id NOT IN dim_specialty
+
+# Load with denormalized specialty
+INSERT INTO dim_provider
+  SELECT p.provider_id, p.first_name, p.last_name,
+         CONCAT('Dr. ', p.first_name, ' ', p.last_name) AS full_name,
+         p.credential, p.specialty_id,
+         s.specialty_name,    # DENORMALIZED
+         s.specialty_code     # DENORMALIZED
+  FROM providers p
+  INNER JOIN specialties s ON p.specialty_id = s.specialty_id
+```
+**Result:** 500 providers, 0 errors
+
+---
+
+## 4. FACT TABLE LOAD
+
+### 4.1 Pre-Load: Create Lookup Tables
+**Purpose:** Avoid 500K subqueries (hours → minutes)
+
+```
+CREATE TEMPORARY TABLE temp_patient_lookup AS
+  SELECT patient_id, patient_key FROM dim_patient;
+
+CREATE TEMPORARY TABLE temp_provider_lookup AS
+  SELECT p.provider_id, dp.provider_key, ds.specialty_key
+  FROM providers p
+  JOIN dim_provider dp ON p.provider_id = dp.provider_id
+  JOIN dim_specialty ds ON p.specialty_id = ds.specialty_id;
+
+CREATE TEMPORARY TABLE temp_department_lookup AS
+  SELECT department_id, department_key FROM dim_department;
+
+CREATE TEMPORARY TABLE temp_encounter_type_lookup AS
+  SELECT encounter_type_name, encounter_type_key FROM dim_encounter_type;
+
+# Pre-aggregate counts
+CREATE TEMPORARY TABLE temp_diagnosis_counts AS
+  SELECT encounter_id, COUNT(*) AS diagnosis_count
+  FROM encounter_diagnoses GROUP BY encounter_id;
+
+CREATE TEMPORARY TABLE temp_procedure_counts AS
+  SELECT encounter_id, COUNT(*) AS procedure_count
+  FROM encounter_procedures GROUP BY encounter_id;
+
+# Pre-aggregate revenue
+CREATE TEMPORARY TABLE temp_billing_totals AS
+  SELECT encounter_id,
+         SUM(claim_amount) AS total_claim_amount,
+         SUM(allowed_amount) AS total_allowed_amount
+  FROM billing GROUP BY encounter_id;
+```
+
+### 4.2 Pre-Load: Validate Dimension Keys
+```
+LOG encounters WHERE patient_id NOT IN temp_patient_lookup AS 'MISSING_PATIENT_KEY'
+LOG encounters WHERE provider_id NOT IN temp_provider_lookup AS 'MISSING_PROVIDER_KEY'
+LOG encounters WHERE department_id NOT IN temp_department_lookup AS 'MISSING_DEPARTMENT_KEY'
+LOG encounters WHERE encounter_type NOT IN temp_encounter_type_lookup AS 'MISSING_ENCOUNTER_TYPE'
+```
+**Result:** 0 validation errors
+
+### 4.3 Load Fact Table (Batched: 100K/batch)
+```
+FOR batch IN (1-100K, 100K-200K, 200K-300K, 300K-400K, 400K-500K):
+  
+  INSERT INTO fact_encounters
+    SELECT e.encounter_id,
+           CAST(DATE_FORMAT(e.encounter_date, '%Y%m%d') AS UNSIGNED) AS date_key,
+           tp.patient_key,
+           tpr.provider_key,
+           tpr.specialty_key,      # From temp_provider_lookup
+           td.department_key,
+           te.encounter_type_key,
+           e.encounter_date,
+           e.discharge_date,
+           COALESCE(tdc.diagnosis_count, 0),     # PRE-AGGREGATED
+           COALESCE(tpc.procedure_count, 0),     # PRE-AGGREGATED
+           COALESCE(tb.total_claim_amount, 0),   # PRE-AGGREGATED
+           COALESCE(tb.total_allowed_amount, 0), # PRE-AGGREGATED
+           CASE WHEN e.encounter_type = 'Inpatient' AND e.discharge_date IS NOT NULL
+                THEN DATEDIFF(e.discharge_date, e.encounter_date)
+                ELSE NULL END AS length_of_stay_days
+    FROM encounters e
+    INNER JOIN temp_patient_lookup tp ON e.patient_id = tp.patient_id
+    INNER JOIN temp_provider_lookup tpr ON e.provider_id = tpr.provider_id
+    INNER JOIN temp_department_lookup td ON e.department_id = td.department_id
+    INNER JOIN temp_encounter_type_lookup te ON e.encounter_type = te.encounter_type_name
+    LEFT JOIN temp_diagnosis_counts tdc ON e.encounter_id = tdc.encounter_id
+    LEFT JOIN temp_procedure_counts tpc ON e.encounter_id = tpc.encounter_id
+    LEFT JOIN temp_billing_totals tb ON e.encounter_id = tb.encounter_id
+    WHERE e.encounter_id BETWEEN batch_start AND batch_end
+  
+  UPDATE etl_batch_control SET last_successful_encounter_id = batch_end
+  LOG batch completion
+```
+**Result:** 500K encounters, ~34 sec/batch, 0 errors
+
+---
+
+## 5. BRIDGE TABLE LOADS
+
+### 5.1 bridge_encounter_diagnoses (Batched: 100K encounters/batch)
+```
+FOR batch IN (1-100K, 100K-200K, 200K-300K, 300K-400K, 400K-500K):
+  
+  # Log orphaned records
+  LOG encounter_diagnoses WHERE encounter_id NOT IN fact_encounters AS 'ORPHAN_DIAGNOSIS'
+  LOG encounter_diagnoses WHERE diagnosis_id NOT IN dim_diagnosis AS 'MISSING_DIAGNOSIS_KEY'
+  
+  # Load valid links
+  INSERT INTO bridge_encounter_diagnoses
+    SELECT tel.encounter_key,
+           dd.diagnosis_key,
+           ed.diagnosis_sequence
+    FROM encounter_diagnoses ed
+    INNER JOIN temp_encounter_lookup tel ON ed.encounter_id = tel.encounter_id
+    INNER JOIN dim_diagnosis dd ON ed.diagnosis_id = dd.diagnosis_id
+    WHERE ed.encounter_id BETWEEN batch_start AND batch_end
+```
+**Result:** 999,570 links, 0 orphans
+
+### 5.2 bridge_encounter_procedures (Batched: 100K encounters/batch)
+```
+FOR batch IN (1-100K, 100K-200K, 200K-300K, 300K-400K, 400K-500K):
+  
+  # Log orphaned records
+  LOG encounter_procedures WHERE encounter_id NOT IN fact_encounters AS 'ORPHAN_PROCEDURE'
+  LOG encounter_procedures WHERE procedure_id NOT IN dim_procedure AS 'MISSING_PROCEDURE_KEY'
+  
+  # Load valid links with sequence
+  INSERT INTO bridge_encounter_procedures
+    SELECT tel.encounter_key,
+           dp.procedure_key,
+           ep.procedure_date,
+           ROW_NUMBER() OVER (PARTITION BY tel.encounter_key 
+                             ORDER BY ep.procedure_date, ep.encounter_procedure_id) AS sequence
+    FROM encounter_procedures ep
+    INNER JOIN temp_encounter_lookup tel ON ep.encounter_id = tel.encounter_id
+    INNER JOIN dim_procedure dp ON ep.procedure_id = dp.procedure_id
+    WHERE ep.encounter_id BETWEEN batch_start AND batch_end
+```
+**Result:** 1,500,221 links, 0 orphans
+
+---
+
+## 6. DATA QUALITY VALIDATION
+
+```
+CHECK 1: Encounter count
+  OLTP: COUNT(*) FROM encounters
+  Star: COUNT(*) FROM fact_encounters
+  Status: MATCH (500,000 = 500,000)
+
+CHECK 2: Patient count
+  OLTP: COUNT(*) FROM patients
+  Star: COUNT(*) FROM dim_patient
+  Status: MATCH (100,000 = 100,000)
+
+CHECK 3: Provider count
+  OLTP: COUNT(*) FROM providers
+  Star: COUNT(*) FROM dim_provider
+  Status: MATCH (500 = 500)
+
+CHECK 4: Diagnosis links
+  OLTP: COUNT(*) FROM encounter_diagnoses
+  Star: COUNT(*) FROM bridge_encounter_diagnoses
+  Status: MATCH (999,570 = 999,570)
+
+CHECK 5: Procedure links
+  OLTP: COUNT(*) FROM encounter_procedures
+  Star: COUNT(*) FROM bridge_encounter_procedures
+  Status: MATCH (1,500,221 = 1,500,221)
+
+CHECK 6: Revenue totals
+  OLTP: SUM(allowed_amount) FROM billing
+  Star: SUM(total_allowed_amount) FROM fact_encounters
+  Status: MATCH ($3,575,482,020.31 = $3,575,482,020.31)
+
+CHECK 7: NULL foreign keys
+  Star: COUNT(*) FROM fact_encounters WHERE any FK IS NULL
+  Status: PASS (0 NULL FKs)
+
+CHECK 8: Orphaned bridge records
+  Star: COUNT(*) FROM bridge tables WHERE encounter_key NOT IN fact_encounters
+  Status: PASS (0 orphans)
+
+CHECK 9: Sample diagnosis count
+  Random encounter: Compare OLTP vs Star diagnosis_count
+  Status: MATCH
 ```
 
 ---
 
-### DIM_PROVIDER (Incremental with Denormalization)
+## 7. ERROR HANDLING
 
-**Purpose**: Load provider data WITH denormalized specialty information
+### 7.1 Error Types
+| Error Type | Description | Action |
+|------------|-------------|--------|
+| INVALID_DOB | NULL/future date_of_birth | Skip, log |
+| MISSING_SPECIALTY | Invalid specialty_id | Skip, log |
+| MISSING_PATIENT_KEY | Unknown patient | Skip, log |
+| MISSING_PROVIDER_KEY | Unknown provider | Skip, log |
+| MISSING_DEPARTMENT_KEY | Unknown department | Skip, log |
+| MISSING_ENCOUNTER_TYPE | Unknown encounter type | Skip, log |
+| ORPHAN_DIAGNOSIS | Diagnosis without encounter | Skip, log |
+| ORPHAN_PROCEDURE | Procedure without encounter | Skip, log |
+| MISSING_DIAGNOSIS_KEY | Unknown diagnosis | Skip, log |
+| MISSING_PROCEDURE_KEY | Unknown procedure | Skip, log |
 
-**Key Challenge**: Must denormalize specialty data
-
-**Pseudocode**:
+### 7.2 Error Handler Pattern
+```sql
+DECLARE EXIT HANDLER FOR SQLEXCEPTION
+BEGIN
+  GET DIAGNOSTICS CONDITION 1 v_error = MESSAGE_TEXT
+  CALL log_etl_event(@batch_id, 'ERROR', 'step', v_error, 0, elapsed)
+  ROLLBACK
+  RESIGNAL
+END
 ```
-FUNCTION load_dim_provider():
-    source_providers = QUERY:
-        SELECT 
-            p.provider_id,
-            p.first_name,
-            p.last_name,
-            p.credential,
-            p.specialty_id,
-            s.specialty_name,      -- DENORMALIZED
-            s.specialty_code       -- DENORMALIZED
-        FROM providers p
-        JOIN specialties s ON p.specialty_id = s.specialty_id
-        WHERE p.modified_date >= YESTERDAY 
-           OR p.provider_id NOT IN (SELECT provider_id FROM dim_provider)
-    
-    FOR EACH provider IN source_providers:
-        full_name = 'Dr. ' + provider.first_name + ' ' + provider.last_name
-        
-        MERGE INTO dim_provider
-        USING source_provider
-        ON dim_provider.provider_id = source_provider.provider_id
-        WHEN MATCHED THEN UPDATE SET
-            first_name = source_provider.first_name,
-            last_name = source_provider.last_name,
-            full_name = calculated_full_name,
-            credential = source_provider.credential,
-            specialty_id = source_provider.specialty_id,
-            specialty_name = source_provider.specialty_name,  -- DENORMALIZED
-            specialty_code = source_provider.specialty_code   -- DENORMALIZED
-        WHEN NOT MATCHED THEN INSERT (...)
-    END FOR
-END FUNCTION
+
+### 7.3 Batch Status Logic
+```
+status = CASE
+  WHEN COUNT(ERROR logs) > 0 THEN 'FAILED'
+  WHEN COUNT(error_records) > 0 THEN 'COMPLETED_WITH_WARNINGS'
+  ELSE 'COMPLETED'
+END
 ```
 
 ---
 
-### DIM_DEPARTMENT, DIM_ENCOUNTER_TYPE (Full Refresh)
+## 8. EXECUTION
 
-**Pseudocode**:
-```
-FUNCTION load_dim_department():
-    TRUNCATE dim_department
-    
-    INSERT INTO dim_department (department_id, department_name, floor, capacity)
-    SELECT department_id, department_name, floor, capacity
-    FROM departments
-END FUNCTION
-
-FUNCTION load_dim_encounter_type():
-    TRUNCATE dim_encounter_type
-    
-    INSERT INTO dim_encounter_type 
-    (encounter_type_name, encounter_type_code, requires_admission, average_duration_hours)
-    VALUES
-        ('Outpatient', 'OP', FALSE, 1.5),
-        ('Inpatient', 'IP', TRUE, 96.0),
-        ('Emergency', 'ER', FALSE, 6.5)
-END FUNCTION
+### 8.1 First Time Setup
+```sql
+SOURCE Hospital_DDL.sql;
+SOURCE generate_dataset.sql;
+SOURCE star_schema.sql;
+SOURCE etl_logging_setup.sql;
+SOURCE etl_pipeline.sql;
+CALL get_batch_summary(@batch_id);
 ```
 
----
-
-### DIM_DIAGNOSIS & DIM_PROCEDURE (Full Refresh)
-
-**Pseudocode**:
+### 8.2 Re-Run ETL
+```sql
+SOURCE clean_star_schema.sql;
+SOURCE etl_pipeline.sql;
 ```
-FUNCTION load_dim_diagnosis():
-    TRUNCATE dim_diagnosis
-    
-    INSERT INTO dim_diagnosis (diagnosis_id, icd10_code, icd10_description)
-    SELECT diagnosis_id, icd10_code, icd10_description
-    FROM diagnoses
-END FUNCTION
 
-FUNCTION load_dim_procedure():
-    TRUNCATE dim_procedure
-    
-    INSERT INTO dim_procedure (procedure_id, cpt_code, cpt_description)
-    SELECT procedure_id, cpt_code, cpt_description
-    FROM procedures
-END FUNCTION
+### 8.3 View Results
+```sql
+-- All batches
+SELECT batch_id, status, 
+       TIMESTAMPDIFF(MINUTE, start_timestamp, end_timestamp) AS minutes,
+       total_rows_processed, total_errors
+FROM etl_batch_control
+ORDER BY start_timestamp DESC;
+
+-- Specific batch
+CALL get_batch_summary('20260121_130753_595');
+
+-- Errors
+SELECT * FROM etl_error_records WHERE resolved = FALSE;
+
+-- Step details
+SELECT log_timestamp, log_level, step_name, message, rows_affected, execution_time_seconds
+FROM etl_log WHERE batch_id = @batch_id ORDER BY log_id;
 ```
 
 ---
 
-## FACT TABLE LOAD LOGIC
+## 9. PERFORMANCE
 
-### FACT_ENCOUNTERS (Incremental Daily Load)
+### 9.1 Actual Metrics
+| Phase | Duration | Records |
+|-------|----------|---------|
+| Dimensions | 30s | 104,641 |
+| Lookup Tables | 15s | 7 tables |
+| Validation | 5s | 0 errors |
+| Facts (5 batches) | 170s | 500,000 |
+| Bridges (10 batches) | 30s | 2,499,791 |
+| Data Quality | 18s | 9 checks |
+| **TOTAL** | **2.87 min** | **3.1M records** |
 
-**Purpose**: Load encounter facts with all dimension keys and pre-aggregated metrics
+### 9.2 Throughput
+- Encounters: 174K/min
+- Bridge records: 833K/min
+- Overall: 1.08M records/min
 
-**Pseudocode**:
+### 9.3 Scalability
+| Encounters | Est. Duration |
+|------------|---------------|
+| 500K | 2.87 min (actual) |
+| 1M | ~6 min |
+| 5M | ~30 min |
+| 10M | ~60 min |
+
+---
+
+## 10. TROUBLESHOOTING
+
+### 10.1 ETL Fails Mid-Batch
+```sql
+-- Find last step
+SELECT * FROM etl_log 
+WHERE batch_id = 'FAILED_BATCH' 
+ORDER BY log_id DESC LIMIT 10;
+
+-- Check errors
+SELECT * FROM etl_log 
+WHERE batch_id = 'FAILED_BATCH' AND log_level = 'ERROR';
+
+-- Resolution
+SOURCE clean_star_schema.sql;
+SOURCE etl_pipeline.sql;
 ```
-FUNCTION load_fact_encounters(load_date):
-    // Extract encounters for load date
-    source_encounters = QUERY:
-        SELECT 
-            e.encounter_id,
-            e.encounter_date,
-            e.discharge_date,
-            e.patient_id,
-            e.provider_id,
-            e.encounter_type,
-            e.department_id
-        FROM encounters e
-        WHERE DATE(e.encounter_date) = load_date
-    
-    FOR EACH encounter IN source_encounters:
-        
-        // --- DIMENSION KEY LOOKUPS ---
-        
-        date_key = FORMAT(encounter.encounter_date, 'YYYYMMDD')
-        
-        patient_key = QUERY:
-            SELECT patient_key FROM dim_patient WHERE patient_id = encounter.patient_id
-        
-        IF patient_key IS NULL:
-            LOG_ERROR("Patient not found: " + encounter.patient_id)
-            SKIP THIS ENCOUNTER
-        
-        provider_key = QUERY:
-            SELECT provider_key FROM dim_provider WHERE provider_id = encounter.provider_id
-        
-        specialty_key = QUERY:
-            SELECT specialty_key FROM dim_specialty 
-            WHERE specialty_id = (
-                SELECT specialty_id FROM providers WHERE provider_id = encounter.provider_id
-            )
-        
-        department_key = QUERY:
-            SELECT department_key FROM dim_department WHERE department_id = encounter.department_id
-        
-        encounter_type_key = QUERY:
-            SELECT encounter_type_key FROM dim_encounter_type 
-            WHERE encounter_type_name = encounter.encounter_type
-        
-        // --- PRE-AGGREGATE METRICS ---
-        
-        diagnosis_count = QUERY:
-            SELECT COUNT(*) FROM encounter_diagnoses WHERE encounter_id = encounter.encounter_id
-        
-        procedure_count = QUERY:
-            SELECT COUNT(*) FROM encounter_procedures WHERE encounter_id = encounter.encounter_id
-        
-        billing_metrics = QUERY:
-            SELECT 
-                SUM(claim_amount) AS total_claim_amount,
-                SUM(allowed_amount) AS total_allowed_amount
-            FROM billing
-            WHERE encounter_id = encounter.encounter_id
-              AND claim_status = 'Paid'
-        
-        IF encounter.encounter_type = 'Inpatient' AND encounter.discharge_date IS NOT NULL:
-            length_of_stay_days = DATEDIFF(encounter.discharge_date, encounter.encounter_date)
-        ELSE:
-            length_of_stay_days = NULL
-        
-        // --- INSERT INTO FACT TABLE ---
-        
-        INSERT INTO fact_encounters (
-            encounter_id,
-            date_key,
-            patient_key,
-            provider_key,
-            specialty_key,
-            department_key,
-            encounter_type_key,
-            encounter_date,
-            discharge_date,
-            diagnosis_count,
-            procedure_count,
-            total_claim_amount,
-            total_allowed_amount,
-            length_of_stay_days,
-            etl_loaded_date
-        ) VALUES (...)
-    END FOR
-    
-    COMMIT
-END FUNCTION
+
+### 10.2 Data Mismatch
+```sql
+-- Compare counts
+SELECT 'Encounters', 
+       (SELECT COUNT(*) FROM encounters) AS oltp,
+       (SELECT COUNT(*) FROM fact_encounters) AS star;
+
+-- Find missing
+SELECT e.encounter_id 
+FROM encounters e
+LEFT JOIN fact_encounters f ON e.encounter_id = f.encounter_id
+WHERE f.encounter_key IS NULL;
+
+-- Check why
+SELECT * FROM etl_error_records WHERE source_id IN (...);
+```
+
+### 10.3 Performance Issues
+```sql
+-- Compare batch times
+SELECT batch_id, TIMESTAMPDIFF(MINUTE, start_timestamp, end_timestamp) AS minutes
+FROM etl_batch_control WHERE status = 'COMPLETED'
+ORDER BY start_timestamp DESC LIMIT 10;
+
+-- Slow steps
+SELECT step_name, execution_time_seconds
+FROM etl_log WHERE batch_id = 'SLOW_BATCH' AND execution_time_seconds > 60
+ORDER BY execution_time_seconds DESC;
 ```
 
 ---
 
-## BRIDGE TABLE LOAD LOGIC
+## 11. KEY DESIGN DECISIONS
 
-### BRIDGE_ENCOUNTER_DIAGNOSES
-
-**Pseudocode**:
-```
-FUNCTION load_bridge_encounter_diagnoses(load_date):
-    source_data = QUERY:
-        SELECT 
-            ed.encounter_id,
-            ed.diagnosis_id,
-            ed.diagnosis_sequence
-        FROM encounter_diagnoses ed
-        JOIN encounters e ON ed.encounter_id = e.encounter_id
-        WHERE DATE(e.encounter_date) = load_date
-    
-    FOR EACH record IN source_data:
-        encounter_key = QUERY:
-            SELECT encounter_key FROM fact_encounters WHERE encounter_id = record.encounter_id
-        
-        diagnosis_key = QUERY:
-            SELECT diagnosis_key FROM dim_diagnosis WHERE diagnosis_id = record.diagnosis_id
-        
-        INSERT INTO bridge_encounter_diagnoses (
-            encounter_key,
-            diagnosis_key,
-            diagnosis_sequence
-        ) VALUES (
-            encounter_key,
-            diagnosis_key,
-            record.diagnosis_sequence
-        )
-    END FOR
-    
-    COMMIT
-END FUNCTION
-```
-
-### BRIDGE_ENCOUNTER_PROCEDURES
-
-**Pseudocode**:
-```
-FUNCTION load_bridge_encounter_procedures(load_date):
-    source_data = QUERY:
-        SELECT 
-            ep.encounter_id,
-            ep.procedure_id,
-            ep.procedure_date,
-            ROW_NUMBER() OVER (PARTITION BY ep.encounter_id 
-                               ORDER BY ep.procedure_date) AS procedure_sequence
-        FROM encounter_procedures ep
-        JOIN encounters e ON ep.encounter_id = e.encounter_id
-        WHERE DATE(e.encounter_date) = load_date
-    
-    FOR EACH record IN source_data:
-        encounter_key = LOOKUP(fact_encounters, encounter_id = record.encounter_id)
-        procedure_key = LOOKUP(dim_procedure, procedure_id = record.procedure_id)
-        
-        INSERT INTO bridge_encounter_procedures (
-            encounter_key,
-            procedure_key,
-            procedure_date,
-            procedure_sequence
-        ) VALUES (...)
-    END FOR
-    
-    COMMIT
-END FUNCTION
-```
+1. **Full Refresh:** Simple, reliable, fast enough for daily loads
+2. **Batching:** 20K for dimensions, 100K for facts - balance between speed and recoverability
+3. **Temporary Lookup Tables:** Critical for performance (hours → minutes)
+4. **Pre-Aggregation:** Counts and totals stored in fact table for query speed
+5. **Denormalization:** Specialty name/code in dim_provider for query simplicity
+6. **Comprehensive Logging:** Every step tracked for troubleshooting
+7. **Error Isolation:** Bad records logged but don't stop ETL
+8. **Restart Capability:** Track last successful encounter for future incremental loads
 
 ---
-
-## REFRESH STRATEGY
-
-### Daily Incremental Load
-
-**Schedule**:
-```
-2:00 AM - Start ETL
-2:00-2:15 AM - Load dimensions
-2:15-3:30 AM - Load fact_encounters
-3:30-4:00 AM - Load bridge tables
-4:00 AM - Data quality checks
-```
-
-**Pseudocode**:
-```
-FUNCTION run_daily_etl():
-    load_date = YESTERDAY
-    
-    TRY:
-        BEGIN TRANSACTION
-        
-        // Dimensions first
-        load_dim_patient()
-        load_dim_provider()
-        load_dim_specialty()
-        load_dim_department()
-        load_dim_encounter_type()
-        load_dim_diagnosis()
-        load_dim_procedure()
-        
-        // Facts second
-        load_fact_encounters(load_date)
-        
-        // Bridges third
-        load_bridge_encounter_diagnoses(load_date)
-        load_bridge_encounter_procedures(load_date)
-        
-        COMMIT
-        
-        run_data_quality_checks(load_date)
-        SEND_SUCCESS_EMAIL("ETL completed")
-        
-    CATCH error:
-        ROLLBACK
-        LOG_ERROR(error)
-        SEND_ALERT_EMAIL("ETL failed: " + error)
-    END TRY
-END FUNCTION
-```
-
----
-
-## DATA QUALITY CHECKS
-
-**Critical checks**:
-
-```
-FUNCTION run_data_quality_checks(load_date):
-    // Check 1: Row counts match
-    oltp_count = COUNT(*) FROM encounters WHERE DATE(encounter_date) = load_date
-    dw_count = COUNT(*) FROM fact_encounters WHERE date_key = FORMAT(load_date, 'YYYYMMDD')
-    
-    ASSERT oltp_count = dw_count
-    
-    // Check 2: No orphaned foreign keys
-    orphans = COUNT(*) FROM fact_encounters f
-              LEFT JOIN dim_patient p ON f.patient_key = p.patient_key
-              WHERE p.patient_key IS NULL
-    
-    ASSERT orphans = 0
-    
-    // Check 3: Pre-aggregated metrics are correct
-    sample = SELECT RANDOM encounter_id FROM fact_encounters
-    
-    expected_diag = COUNT(*) FROM encounter_diagnoses WHERE encounter_id = sample
-    actual_diag = SELECT diagnosis_count FROM fact_encounters WHERE encounter_id = sample
-    
-    ASSERT expected_diag = actual_diag
-    
-    // Check 4: Revenue totals match
-    oltp_revenue = SUM(allowed_amount) FROM billing 
-                   WHERE encounter_id IN (today's encounters)
-    dw_revenue = SUM(total_allowed_amount) FROM fact_encounters WHERE date_key = today
-    
-    ASSERT oltp_revenue = dw_revenue
-END FUNCTION
-```
+ 
+**Last Updated:** January 2026  
+**Actual Performance:** 2.87 minutes | 0 errors | 100% data quality

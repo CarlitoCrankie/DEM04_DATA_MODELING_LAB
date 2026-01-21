@@ -242,49 +242,33 @@ CREATE TABLE fact_encounters (
 -- BRIDGE TABLES FOR MANY-TO-MANY RELATIONSHIPS
 
 -- bridge_encounter_diagnoses: Links encounters to diagnoses
-/*
-    Purpose: Handles many-to-many relationship between encounters and diagnoses
-    Grain: One row per diagnosis within an encounter
-*/
-
 CREATE TABLE bridge_encounter_diagnoses (
-    encounter_key INT NOT NULL,                   -- FK to fact_encounters
-    diagnosis_key INT NOT NULL,                   -- FK to dim_diagnosis
-    diagnosis_sequence INT NOT NULL,              -- 1=primary, 2=secondary, etc.
+    encounter_key INT NOT NULL,
+    diagnosis_key INT NOT NULL,
+    diagnosis_sequence INT NOT NULL,
     
-    -- Compound primary key
-    PRIMARY KEY (encounter_key, diagnosis_key, diagnosis_sequence)
-
+    PRIMARY KEY (encounter_key, diagnosis_key, diagnosis_sequence),
     
-    -- Foreign key constraints
     FOREIGN KEY (encounter_key) REFERENCES fact_encounters(encounter_key),
     FOREIGN KEY (diagnosis_key) REFERENCES dim_diagnosis(diagnosis_key),
     
-    -- Indexes for common queries
-    INDEX idx_diagnosis_key (diagnosis_key),      -- Find encounters by diagnosis
-    INDEX idx_encounter_key (encounter_key)       -- Find diagnoses by encounter
+    INDEX idx_diagnosis_key (diagnosis_key),
+    INDEX idx_encounter_key (encounter_key)
 );
 
--- bridge_encounter_procedures:
+-- bridge_encounter_procedures: Links encounters to procedures
 CREATE TABLE bridge_encounter_procedures (
-    encounter_key INT NOT NULL,                   -- FK to fact_encounters
-    procedure_key INT NOT NULL,                   -- FK to dim_procedure
-    procedure_date DATE NOT NULL,                 -- When procedure was performed
-    procedure_sequence INT,                       -- Order within encounter
+    encounter_key INT NOT NULL,
+    procedure_key INT NOT NULL,
+    procedure_date DATE NOT NULL,
+    procedure_sequence INT,
     
-    -- Compound primary key
-    PRIMARY KEY (
-    encounter_key,
-    procedure_key,
-    procedure_sequence
-)
+    PRIMARY KEY (encounter_key, procedure_key, procedure_sequence),
     
-    -- Foreign key constraints
     FOREIGN KEY (encounter_key) REFERENCES fact_encounters(encounter_key),
     FOREIGN KEY (procedure_key) REFERENCES dim_procedure(procedure_key),
     
-    -- Indexes for common queries
-    INDEX idx_procedure_key (procedure_key),      -- Find encounters by procedure
-    INDEX idx_encounter_key (encounter_key),      -- Find procedures by encounter
-    INDEX idx_procedure_date (procedure_date)     -- Time-based procedure analysis
+    INDEX idx_procedure_key (procedure_key),
+    INDEX idx_encounter_key (encounter_key),
+    INDEX idx_procedure_date (procedure_date)
 );
