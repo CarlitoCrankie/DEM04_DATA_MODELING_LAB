@@ -1,7 +1,10 @@
-STAR SCHEMA OPTIMIZED QUERIES
+# STAR SCHEMA OPTIMIZED QUERIES
+
 ========================================
 
-QUERY 1: Monthly Encounters By Specialty
+## QUERY 1: Monthly Encounters By Specialty
+
+```sql
 SELECT 
     d.month_year,
     s.specialty_name,
@@ -12,95 +15,155 @@ FROM fact_encounters f
 JOIN dim_date d ON f.date_key = d.date_key
 JOIN dim_specialty s ON f.specialty_key = s.specialty_key
 JOIN dim_encounter_type et ON f.encounter_type_key = et.encounter_type_key
+WHERE d.year >= 2022
 GROUP BY 
     d.month_year,
     s.specialty_name,
     et.encounter_type_name
-ORDER BY d.month_year, s.specialty_name, et.encounter_type_name
+ORDER BY d.year DESC, d.month DESC, s.specialty_name
 LIMIT 10;
+```
 
-Execution Time
-* ~115 ms vs. ~39 ms (OLTP)
+### Execution Time
 
-Improvement Factor
-* 0.3× (Star slower at this scale)
+* ~5,334 ms vs. ~2,551 ms (OLTP)
 
-Explanation
-* Dataset is small; OLTP indexes are already efficient
-* Additional dimension joins introduce overhead
-* Star schema advantage not visible at low volume
+### Improvement Factor
 
+* 0.48× (Star slower at this scale)
 
-QUERY 2: Top Diagnosis-Procedure Pairs
+### Explanation
+
+* Three dimension joins introduce additional overhead
+* Fact table rows are wider, increasing scan cost
+* OLTP’s simpler join path is highly optimized at this volume
+* Small result set (10 rows) does not benefit from star schema structure
+
+---
+
+## QUERY 2: Top Diagnosis–Procedure Pairs
+
+```sql
 SELECT 
     diag.icd10_code,
+    diag.icd10_description,
     proc.cpt_code,
+    proc.cpt_description,
     COUNT(DISTINCT f.encounter_key) AS encounter_count
 FROM fact_encounters f
 JOIN bridge_encounter_diagnoses bd ON f.encounter_key = bd.encounter_key
-JOIN bridge_encounter_procedures bp ON f.encounter_key = bp.encounter_key
 JOIN dim_diagnosis diag ON bd.diagnosis_key = diag.diagnosis_key
+JOIN bridge_encounter_procedures bp ON f.encounter_key = bp.encounter_key
 JOIN dim_procedure proc ON bp.procedure_key = proc.procedure_key
-GROUP BY diag.icd10_code, proc.cpt_code
+GROUP BY 
+    diag.icd10_code,
+    diag.icd10_description,
+    proc.cpt_code,
+    proc.cpt_description
 ORDER BY encounter_count DESC
 LIMIT 20;
+```
 
-Execution Time
-* ~35 ms vs. ~39 ms (OLTP)
+### Execution Time
 
-Improvement Factor
-* 1.1× faster
+* ~24,470 ms vs. ~32,677 ms (OLTP)
 
-Explanation
-* Integer surrogate keys speed up joins
-* Bridge tables simplify many-to-many relationships
-* Reduced natural-key comparisons
+### Improvement Factor
 
+* 1.34× faster
 
-QUERY 3: 30-Day Readmission Rate
+### Explanation
+
+* Integer surrogate keys outperform VARCHAR-based joins
+* Bridge tables structure many-to-many relationships efficiently
+* Smaller indexes reduce join and comparison cost
+* Cartesian explosion impact is reduced compared to OLTP
+
+---
+
+## QUERY 3: 30-Day Readmission Rate
+
+```sql
 SELECT 
     s.specialty_name,
-    COUNT(DISTINCT e1.encounter_key) AS total_discharges,
-    COUNT(DISTINCT e2.encounter_key) AS readmissions
+    COUNT(DISTINCT e1.encounter_key) AS total_inpatient_discharges,
+    COUNT(DISTINCT e2.encounter_key) AS readmissions_within_30_days,
+    ROUND(
+        100.0 * COUNT(DISTINCT e2.encounter_key) /
+        NULLIF(COUNT(DISTINCT e1.encounter_key), 0), 
+        2
+    ) AS readmission_rate_pct
 FROM fact_encounters e1
 JOIN dim_specialty s ON e1.specialty_key = s.specialty_key
+JOIN dim_encounter_type et1 ON e1.encounter_type_key = et1.encounter_type_key
+JOIN dim_date d1 ON e1.date_key = d1.date_key
 LEFT JOIN fact_encounters e2
-  ON e1.patient_key = e2.patient_key
- AND e2.encounter_date BETWEEN e1.discharge_date
-                           AND DATE_ADD(e1.discharge_date, INTERVAL 30 DAY)
-WHERE e1.discharge_date IS NOT NULL
+  ON e2.patient_key = e1.patient_key
+ AND e2.encounter_type_key = (
+        SELECT encounter_type_key 
+        FROM dim_encounter_type 
+        WHERE encounter_type_code = 'IP'
+     )
+ AND e2.encounter_date > e1.discharge_date
+ AND e2.encounter_date <= DATE_ADD(e1.discharge_date, INTERVAL 30 DAY)
+WHERE 
+    et1.encounter_type_code = 'IP'
+    AND e1.discharge_date IS NOT NULL
+    AND d1.year >= 2022
 GROUP BY s.specialty_name;
+```
 
-Execution Time
-* ~61 ms vs. ~48 ms (OLTP)
+### Execution Time
 
-Improvement Factor
-* 0.8× (Star slower at this scale)
+* ~5,410 ms vs. ~5,289 ms (OLTP)
 
-Explanation
-* Self-join dominates query cost
-* Star schema benefits appear only at large fact sizes
-* Dimension joins add overhead with small datasets
+### Improvement Factor
 
+*  0.98× (essentially equal)
 
-QUERY 4: Revenue by Specialty and Month
+### Explanation
+
+* Self-join dominates query cost in both schemas
+* Fact table must be scanned twice regardless of design
+* Additional dimension joins add slight overhead
+* Schema choice has minimal impact for self-join workloads
+
+---
+
+## QUERY 4: Revenue by Specialty and Month
+
+```sql
 SELECT 
     d.month_year,
     s.specialty_name,
-    SUM(f.total_allowed_amount) AS total_revenue
+    COUNT(*) AS total_encounters,
+    COUNT(CASE WHEN f.total_allowed_amount IS NOT NULL THEN 1 END) AS billed_encounters,
+    SUM(f.total_claim_amount) AS total_billed,
+    SUM(f.total_allowed_amount) AS total_revenue,
+    ROUND(AVG(f.total_allowed_amount), 2) AS avg_revenue_per_encounter
 FROM fact_encounters f
 JOIN dim_date d ON f.date_key = d.date_key
 JOIN dim_specialty s ON f.specialty_key = s.specialty_key
-GROUP BY d.month_year, s.specialty_name;
+WHERE 
+    d.year >= 2022
+    AND f.total_allowed_amount IS NOT NULL
+GROUP BY d.month_year, s.specialty_name
+ORDER BY d.year DESC, d.month DESC, total_revenue DESC
+LIMIT 20;
+```
 
+### Execution Time
 
-Execution Time
-* ~32 ms vs. ~17 ms (OLTP)
+* ~3,083 ms vs. ~7,501 ms (OLTP)
 
-Improvement Factor
-* 0.5× (Star slower at this scale)
+### Improvement Factor
 
-Explanation
-* Aggregation cost is low with limited rows
-* OLTP billing joins already well indexed
-* Star schema benefits emerge with large fact tables
+* 2.43× faster
+
+### Explanation
+
+* Billing table join completely eliminated
+* Revenue values pre-aggregated during ETL
+* No DATE_FORMAT() calls at query time
+* Fewer joins and simpler aggregation logic
+
